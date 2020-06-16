@@ -1,0 +1,717 @@
+---
+title: "Pump it Up - Aplicación de EDA, Feature Engineering, y Random Forest"
+author:   "by [Álvaro León](https://www.linkedin.com/in/aleongarrido/)"
+mail:     "alvaroleongarrido@gmail.com"
+linkedin: "aleongarrido"
+github:   "alvaroleongarrido"
+date:     "`r Sys.Date()`"
+license:  by-nc-sa
+urlcolor: blue
+output:
+  html_document:
+    theme: sandstone
+    highlight: tango
+    toc: TRUE
+    toc_float: TRUE
+    code_folding: show
+    includes:
+  pdf_document: default
+  epuRate::epurate:
+    number_sections: FALSE
+    code_folding: "show"
+    toc: TRUE 
+    word_document: default
+  rmdformats::readthedown:
+    toc: TRUE 
+    toc_float: TRUE     
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '/Users/fuser/Desktop/Master Big Data & Data Science/8. M8 - Machine Learning/R/Tarea preliminar')
+```
+
+## Introducción
+
+En este documento expondremos los pasos y las decisiones que hemos tomado para elaborar un **modelo de clasificación para predecir el estado de bombas de extracción de agua** en Tanzania, como parte de la competición de [Driven Data](https://www.drivendata.org/competitions/7/pump-it-up-data-mining-the-water-table/). Específicamente, el objetivo del ejercicio es conocer, comprender y preparar los datos para disponibles para generar dicho modelo de clasificación.
+
+La información disponibles se componen de dos conjuntos de datos: uno de entrenamiento con 59.400 observaciones, y otro de prueba con 14.850 observaciones; y 40 variables o características que describen distintas características endógenas y exógenas de las bombas de agua en Tanzania. 
+
+
+
+<p align="center">
+  <img width="50%" height="50%" src="data/bombas.png">
+</p>
+
+
+
+En la primera parte del documento se describen algunas características de los datos, destacando sus atributos y algunas relaciones bi-variantes con la variable objetivo. Con esto como insumo, se exponen las decisiones de feature engineering (tanto las que han tenido resultados positivos como las que no). Finalmente, exponemos los modelos que hemos utilizado, y concluimos con una pequeña descripción del modelo ganador que nos ha permitido obtener una puntuación de **0,8259** en la competición. Finalmente, se adelanta que, en general, se han realizado mayoritariamente procesos automáticos pues el trabajo manual y más *artesanal* no ha tenido resultados positivos (se expondrán igualmente).
+
+
+---
+
+## Preámbulo
+**Importar librerías y datos**
+<br>Con el fin de no duplicar las recodificaciones y/o transformaciones a los datos (tanto en train como en test), reunimos todo en un dataset, con una etiqueta *ad hoc* que nos permitirá separarla posteriormente. 
+**Nota:** Varias operaciones que realizaremos requieren que el dataset sea un objeto `data.frame`, por tanto cargamos la información con `read.csv` y no con `fread` que genera un objeto `data.table`.
+
+```{r}
+# Cargo librerías con paquete "pacman".
+library(pacman)
+p_load(data.table, inspectdf, dplyr, tidyr, ranger, caret, tictoc, ggplot2, ggmosaic, stringr, tm, stringi, lubridate, ranger, dataPreparation, missForest, fastDummies, stringdist)
+
+# Cargo datos 
+train = read.csv('data/Training set values.csv')
+test = read.csv('data/Test set values.csv')
+target = read.csv('data/Training set labels.csv')
+# Agrego identificador
+train$etiqueta = 'train'
+test$etiqueta = 'test'
+# Junto todo
+raw = rbind(train, test)
+```
+
+
+---
+
+## Exploratory Data Analysis
+
+### Características generales
+
+De las 40 variables, 30 son categóricas y 10 numéricas (el string es la etiqueta que hemos agregado para diferenciar los datos train/test).
+
+```{r}
+table(sapply(raw, class))
+```
+
+
+Ahora, si observamos la distribución de la variable objetivo vemos rápidamente que **el problema será identificar las bombas que necesitan reparación** (su frecuencia es la más baja, por lo que son las que más le costará identificar el modelo). El conjunto de datos está muy desbalanceado, así que una de las cuestiones que sin duda exploraremos será soluciones para aquello. 
+
+```{r, fig.align='center', echo=FALSE, fig.height=5, fig.width=5}
+target %>% count(status_group) %>%
+  ggplot(aes(x = status_group, y = n)) +
+  geom_bar(stat = 'identity', fill='grey') +
+  labs(title = 'Cantidad de bombas según su estado', subtitle = 'Distribución en conjunto train') +
+  xlab('Estado de las bombas') +
+  ylab('Cantidad de bombas') +
+  theme(legend.position = "none") +
+  geom_text(aes(label=n), vjust=1.5, colour='white') +
+  theme_light()
+```
+
+
+Luego, una mirada al conjunto de datos permite observar que no están en muy buen estado desde el punto de vista de la complitud de la información en bastantes variables, y de las características de las categóricas. Partamos por esto último. El gráfico ulterior muestra que hay bastantes features con excesivas características (orden de miles). En general son territorios y nombres de instituciones, y más tarde describiremos estrategias para resolver este problema.
+
+```{r, results='hide', message=FALSE, fig.align='center', fig.height=5, echo=F}
+show_plot(inspect_cat(raw))
+```
+
+Luego, algunas variables numéricas tienen muchos valores perdidos escondidos. Por ejemplo, `population` tiene 26.834 valores 0; `construction_year` poco menos, 25.969; y las coordenadas `longitude` y `latitude`, 2.269 valores perdidos (hay más variables con este comportamiento -`NA` camuflado como cero).
+
+
+```{r, echo=FALSE}
+map1 = ggplot(data = raw,
+              mapping = aes(longitude, latitude, color = region)) +
+  geom_point(alpha = 0.5) + theme_void() + theme(legend.position = "none")
+```
+
+
+
+```{r, echo=FALSE}
+###---------- Corregir coordenadas
+raw = raw %>%  #con subvillas en cada región
+  mutate(
+    longitude = ifelse(longitude == 0, NA, longitude),
+    latitude = ifelse(latitude == -2e-08, NA, latitude)
+  ) %>%
+  group_by(region, subvillage) %>%
+  mutate(
+    longitude = ifelse(is.na(longitude), mean(longitude[!is.na(longitude)]), longitude),
+    latitude = ifelse(is.na(latitude), mean(latitude[!is.na(latitude)]), latitude)
+  ) %>% ungroup()
+
+raw = raw %>%
+  group_by(region, ward) %>% # con wards en cada región
+  mutate(
+    longitude = ifelse(is.nan(longitude), mean(longitude[!is.nan(longitude)]), longitude),
+    latitude = ifelse(is.nan(latitude), mean(latitude[!is.nan(latitude)]), latitude)
+  ) %>% ungroup()
+
+raw = raw %>%
+  group_by(region, lga) %>% # con distritos en cada región
+  mutate(
+    longitude = ifelse(is.nan(longitude), mean(longitude[!is.nan(longitude)]), longitude),
+    latitude = ifelse(is.nan(latitude), mean(latitude[!is.nan(latitude)]), latitude)
+  ) %>% ungroup()
+
+# Nuevo mapa
+map2 = ggplot(data = raw,
+              mapping = aes(longitude, latitude, color = region)) +
+  geom_point(alpha = 0.5) + theme_void() + theme(legend.position = "none")
+```
+
+
+
+Visualicemos el efecto de este problema sobre las coordenadas `longitude` y `latitude`. **A la izquierda**, el scatter plot de coordenadas de las bombas de agua. Claramente en la esquina superior izquierda hay datos defectuosos. Por otra parte, **el gráfico de la derecha** muestra la localización de las bombas con la información de coordenadas corregidas, lo que genera un mapa artificial bastante aceptable de los límites políticos de Tanzania.
+
+```{r, warning=FALSE, echo=FALSE, message=FALSE, fig.show='hold', out.width = "50%", warning=FALSE, results='hide'}
+map1
+map2
+```
+
+### Aspectos específicos
+#### Variables que no aportan información.
+
+Hay muchas variables muy parecidas e incluso idénticas (repiten información). No obstante, al no incluirlas algunos modelos disminuyen su poder de clasificación (cuestión muy extraña). Aquí vamos a describir estas variables, su comportamiento con *target*, y eliminaremos sólo las que repiten 100% información.
+
+En primer lugar, observamos que hay 37 observaciones repetidas en el dataset de entrenamiento (misma información en todas las variables). Las vamos a eliminar.
+```{r}
+duplicados = raw %>% filter(etiqueta=='train') %>% select(-id) %>% duplicated() %>% which()
+raw = raw %>% slice(-duplicados)
+```
+
+
+
+**num_private / recorded_by**
+<br>Estas dos variables no entregan información alguna. Directamente las eliminamos.
+```{r}
+raw$num_private = NULL
+raw$recorded_by = NULL
+```
+
+
+
+**quantity / quantity_group**
+<br>Estas variables son exactamente iguales. Dejaremos la que se escribe más corto.
+
+```{r}
+table(raw$quantity, raw$quantity_group)
+```
+```{r}
+raw$quantity_group = NULL
+```
+
+
+
+Esta variable puede ayudar bastante al modelo. Vemos que en términos relativos, las bombas con suficiente agua tienden a estar en funcionamiento. En cambio, las secas tienden a no estar en funcionamiento.
+
+```{r, fig.align='center', echo=FALSE, fig.height=4, fig.width=8}
+raw %>% filter(etiqueta=='train') %>% left_join(target, by='id') %>%
+  group_by(quantity, status_group) %>% summarise(total=n()) %>% arrange(desc(total)) %>%
+  ggplot(aes(x=reorder(quantity, -total), y=total, fill=status_group)) +
+  geom_col(position = 'dodge') +
+  xlab('Características de la cantidad de agua') +
+  ylab('Cantidad de bombas') +
+  guides(fill=guide_legend(title="Estado de las bombas")) +
+  theme_light()
+```
+
+
+
+**scheme_management / management / management_group**
+<br>Hay tres variables que registran el tipo de institución que administra las bombas. Al no ser **exactamente** iguales, decidimos dejar las tres, porque como hemos dicho, quitar una puede tener efectos negativos sobre alguno de los modelos.
+Ahora, si exploramos `management`, que es la más información entrega, vemos que sus tres categorías mayoritarias tienen una distribución del estado de las bombas distinto, por lo que podría aportar información al modelo.
+```{r, fig.align='center', echo=FALSE, fig.height=4, fig.width=8}
+raw %>% filter(etiqueta=='train') %>% left_join(target, by='id') %>%
+  group_by(management, status_group) %>% summarise(total=n()) %>% arrange(desc(total)) %>%
+  ggplot(aes(x=reorder(management, -total), y=total, fill=status_group)) +
+  geom_col(position = 'dodge') +
+  xlab('Características de la cantidad de agua') +
+  ylab('Cantidad de bombas') +
+  guides(fill=guide_legend(title="Estado de las bombas")) +
+  theme_light() +
+  coord_flip()
+```
+
+
+**source / source_type / source_class**
+<br>También hay tres variables que registran la fuente de alimentación o el origen del agua de la bomba. Tampoco son exactamente iguales, así es que dejamos las tres. Esta variable definitivamente aportará información al modelo. Vemos que los pozos poco profundos y las máquinas DBH tienen proporcional y relativamente más bombas fuera de funcionamiento que el resto. También puede ser una variable importante.
+```{r, fig.align='center', echo=FALSE, fig.height=4, fig.width=8}
+raw %>% filter(etiqueta=='train') %>% left_join(target, by='id') %>%
+  group_by(source, status_group) %>% summarise(total=n()) %>% arrange(desc(total)) %>%
+  ggplot(aes(x=reorder(source, -total), y=total, fill=status_group)) +
+  geom_col(position = 'dodge') +
+  xlab('Características de la cantidad de agua') +
+  ylab('Cantidad de bombas') +
+  guides(fill=guide_legend(title="Estado de las bombas")) +
+  theme_light() +
+  coord_flip()
+```
+
+**payment / payment_type**
+<br>Estas variables son exactamente iguales. Vamos a eliminar la que se escribe más largo.
+```{r, echo=F}
+table(raw$payment, raw$payment_type)
+```
+
+Las bombas que nunca fueron pagadas tienen más propención a estar sin funcionamiento. También puede servir al modelo.
+
+```{r, fig.align='center', echo=FALSE, fig.height=4, fig.width=8}
+raw$payment_type = NULL
+raw %>% filter(etiqueta=='train') %>% left_join(target, by='id') %>%
+  group_by(payment, status_group) %>% summarise(total=n()) %>% arrange(desc(total)) %>%
+  ggplot(aes(x=reorder(payment, -total), y=total, fill=status_group)) +
+  geom_col(position = 'dodge') +
+  xlab('Características de la cantidad de agua') +
+  ylab('Cantidad de bombas') +
+  guides(fill=guide_legend(title="Estado de las bombas")) +
+  theme_light() +
+  coord_flip()
+```
+
+**waterpoint_type / waterpoint_type_group**
+<br>Son muy parecidas, salvo que `waterpoint_type` tiene una categoría más que aporta un leve detalle. Dejamos aquella.
+
+```{r, echo=F}
+table(raw$waterpoint_type, raw$waterpoint_type_group) 
+```
+
+Además, *communal standpipe multiple* y *other* permiten discriminar respecto al estado de las bombas. Esta también puede ser una variable importante.
+
+```{r, fig.align='center', echo=FALSE, fig.height=4, fig.width=8}
+raw$waterpoint_type_group = NULL
+raw %>% filter(etiqueta=='train') %>% left_join(target, by='id') %>%
+  group_by(waterpoint_type, status_group) %>% summarise(total=n()) %>% arrange(desc(total)) %>%
+  ggplot(aes(x=reorder(waterpoint_type, -total), y=total, fill=status_group)) +
+  geom_col(position = 'dodge') +
+  xlab('Características de la cantidad de agua') +
+  ylab('Cantidad de bombas') +
+  guides(fill=guide_legend(title="Estado de las bombas")) +
+  theme_light() +
+  coord_flip()
+```
+
+**extraction_type / extraction_type_group / extraction_type_class**
+<br>Finalmente, estas tres categorías son muy parecidas y autocontenidas. No obstante, al no ser iguales, las dejamos.
+También es una variable que permitirá al modelo discriminar respecto al estado de las bombas.
+
+```{r, fig.align='center', echo=FALSE, fig.height=4, fig.width=8}
+raw %>% filter(etiqueta=='train') %>% left_join(target, by='id') %>%
+  group_by(extraction_type_group, status_group) %>% summarise(total=n()) %>% arrange(desc(total)) %>%
+  ggplot(aes(x=reorder(extraction_type_group, -total), y=total, fill=status_group)) +
+  geom_col(position = 'dodge') +
+  xlab('Características de la cantidad de agua') +
+  ylab('Cantidad de bombas') +
+  guides(fill=guide_legend(title="Estado de las bombas")) +
+  theme_light() +
+  coord_flip()
+```
+
+
+---
+
+
+## Feature Engineering
+Como se ha comentado al comienzo de este documento, muchas adaptaciones a las features -aunque razonables- no tuvieron resultados positivos para los modelos de clasificación. En el comienzo de este apartado expondremos las que hemos consolidado e implementado, y en una segunda parte, las que hemos practicado pero finalmente no implementado.
+
+### Tratamiento de missing
+
+ + **Coordenadas**. Para corregir las coordenadas con valores fuera de rango, hemos imputado con la media de la unidad territorial más pequeña posible. Cabe destacar que hemos identificado que hay subvillas con nombres repetidos en distintas regiones, por lo que la imputación debe hacerse a través de la agrupación (`group_by`) **Región + Unidad territorial más pequeña**.
+ 
+Así, lo primero que hacemos es convertir los ceros de `longitude` y -2e-08 de `latitude` a `NA`. Luego, imputamos a estas variables la media de cada `subvillage` contenida en la misma `region`; luego lo propio con `ward`, y finalmente `lga`. Así eliminamos todos los valores perdidos de las coordenadas. Se comprueba a través del mapa anterior que ninguna bomba quedó en una región que no le correspondiera (no hay puntos de color distinto al que conforma una región).
+
+
+```{r, eval=FALSE}
+raw = raw %>%  #con subvillas en cada región
+  mutate(
+    longitude = ifelse(longitude == 0, NA, longitude),
+    latitude = ifelse(latitude == -2e-08, NA, latitude)
+  ) %>%
+  group_by(region, subvillage) %>%
+  mutate(
+    longitude = ifelse(is.na(longitude), mean(longitude[!is.na(longitude)]), longitude),
+    latitude = ifelse(is.na(latitude), mean(latitude[!is.na(latitude)]), latitude)
+  ) %>% ungroup()
+
+raw = raw %>%
+  group_by(region, ward) %>% # con wards en cada región
+  mutate(
+    longitude = ifelse(is.nan(longitude), mean(longitude[!is.nan(longitude)]), longitude),
+    latitude = ifelse(is.nan(latitude), mean(latitude[!is.nan(latitude)]), latitude)
+  ) %>% ungroup()
+
+raw = raw %>%
+  group_by(region, lga) %>% # con distritos en cada región
+  mutate(
+    longitude = ifelse(is.nan(longitude), mean(longitude[!is.nan(longitude)]), longitude),
+    latitude = ifelse(is.nan(latitude), mean(latitude[!is.nan(latitude)]), latitude)
+  ) %>% ungroup()
+```
+
+```{r, results='hide', message=FALSE, fig.align='center', fig.height=5, echo=F}
+tanzania = raster::getData("GADM", country="TZ", level=1)
+tanzania@data$id = rownames(tanzania@data)
+tanzania_pts = fortify(tanzania, region='id')
+tanzania_map = left_join(tanzania_pts, tanzania@data, by='id')
+
+# Graficamos
+raw %>% filter(etiqueta=='train') %>% left_join(target, by='id') %>%
+  ggplot() + 
+  geom_polygon(data = tanzania_map, aes(x=long, y=lat, group = group), colour='grey', fill=NA) +
+  geom_point(aes(longitude, latitude, color=status_group), size=0.3, alpha=0.7) +
+  theme_void() +
+  coord_equal()
+```
+
+
+Lo mismo podemos hacerlo con `population`: Los registros que tengan valor 0 de población serán imputados por el valor que tenga la región/subvilla en otro registro. En su defecto, de no haber una subvilla con información a utilizar, se imputará la media de población de una subvilla tipo en cada ward (unidad territorial superior a subvilla). 
+
+Ahora bien, el conjunto de datos tiene información bastante inconsistente al respecto, por lo que tendremos que tomar más decisiones. Veamos: Una misma `subvillage` ("Utaturuni"), de la misma `region`, `lga` y `ward` registran población distinta (incluso para años de construcción iguales, como 1978). 
+
+
+```{r}
+raw %>%
+  select(subvillage, region, lga, ward, construction_year, population) %>%
+  filter(subvillage == 'Utaturuni')
+```
+
+
+
+Una alternativa larga sería generar promedios de población para cada subvilla en cada año de construcción. Luego, promedio de población en cada subvilla tipo según cada ward para cada año de construcción (promedio de población de cada ward dividido por el número de subvillas que la conforma), y así subiendo los niveles territoriales. Lo anterior sería una buena pero larga opción. En cambio, "simplemente" imputaremos el valor promedio de cada subvilla para cada ward, sin considerar año de construcción. Así, finalmente, no tenemos registros con población cero.
+
+```{r}
+raw = raw %>%  #con subvillas en cada ward
+  mutate(
+    population = ifelse(population == 0, NA, population)
+  ) %>%
+  group_by(ward, subvillage) %>%
+  mutate(
+    population = ifelse(is.na(population), mean(population[!is.na(population)]), population)
+  ) %>% ungroup()
+
+raw = raw %>%  #con ward
+  group_by(ward) %>%
+  mutate(
+    population = ifelse(is.na(population), mean(population[!is.na(population)]), population)
+  ) %>% ungroup() 
+
+raw = raw %>%  #con lga
+  group_by(lga) %>%
+  mutate(
+    population = ifelse(is.na(population), mean(population[!is.na(population)]), population)
+  ) %>% ungroup()
+
+raw = raw %>%  #con region
+  group_by(region) %>%
+  mutate(
+    population = ifelse(is.na(population), mean(population[!is.na(population)]), population)
+  ) %>% ungroup()
+```
+
+
+
+
+Finalmente, debemos tratar la imputación de los valores perdidos de `construction_year`. La primera aproximación fue utilizar la función de imputación de missings de ranger, `missRanger`. No obstante, aunque realizó imputaciones bastante razonables, no resultó en una mejora del modelo (sino todo lo contrario.)
+
+`construction_year` tiene una importante relación con `status_group`, pero hacer imputaciones desde la target tampoco tuvo buenos resultados (significó importante sobre ajuste). Por ello, hemos explorado la asociación de la variable con otras categóricas (pues con variables numéricas no hay asociación meritoria), y la que mejor discrimina es `quantity` (vimos gráficos arriba). Por lo tanto, lo que hemos hecho es utilizar esta variable para imputar el año de construcción.
+
+
+El *boxplot* ulterior ilustra los cuartiles y la media (punto rojo+label) de los años de construcción de las bombas según la cantidad de agua que tenga cada una de ellas. Al no existir *outliers* significativos, utilizaremos la media de años de cada atributo de `quantity` para imputar los valores perdidos de este feature.
+
+
+```{r, message=FALSE, warning=FALSE, fig.align='center'}
+raw_constr = raw %>% filter(construction_year!=0)
+# quantity=dry
+ggplot(raw_constr, aes(x = quantity, y = construction_year)) +
+  geom_boxplot() + 
+  stat_summary(fun = mean, shape=20, color='red') +
+  stat_summary(aes(label=round(..y..)), fun=mean, geom="text", size=3, vjust = +1.5)
+```
+
+
+De este modo, la imputación quedaría así:
+
+```{r}
+raw = raw %>% mutate(
+  construction_year = ifelse(
+    construction_year == 0 & quantity == 'dry',
+    1900,
+    construction_year
+  ),
+  construction_year = ifelse(
+    construction_year == 0 & quantity == 'enough',
+    1998,
+    construction_year
+  ),
+  construction_year = ifelse(
+    construction_year == 0 & quantity == 'insufficient',
+    1996,
+    construction_year
+  ),
+  construction_year = ifelse(
+    construction_year == 0 & quantity == 'seasonal',
+    1999,
+    construction_year
+  ),
+  construction_year = ifelse(
+    construction_year == 0 & quantity == 'unknown',
+    1997,
+    construction_year
+  )
+)
+```
+
+
+Finalmente, imputamos la categoría `unknown` a los valores vacíos de `permit` y `public_meeting`.
+
+```{r}
+# En permit
+raw$permit = as.character(raw$permit)
+raw = raw %>% mutate(permit = ifelse(permit=='', 'Unknown', permit))
+
+# En public_meeting
+raw$public_meeting = as.character(raw$public_meeting)
+raw = raw %>% mutate(public_meeting = ifelse(public_meeting=='', 'Unknown', public_meeting))
+```
+
+
+### Creación de variables
+
+Primero, tras haber corregido los missing de `construction_year`, creamos una variable que registra la antiguedad de la bomba en días. Además, creamos una variable de la diferencia entre la fecha de construcción y la fecha de registro de la bomba.
+
+```{r}
+# Damos formato fecha al año de construcción (en nueva variable)
+raw$construction_year_2 = paste(raw$construction_year,'01','01',sep = '-')
+# Creamos la antiguedad en días de la bomba respecto al último registro
+raw$pump_age = as.Date('2014-01-01', format="%Y-%m-%d") - as.Date(raw$construction_year_2, format="%Y-%m-%d")
+# Creamos la diferencia entre construcción y fecha de registro
+raw$dif_regconstr = as.Date(as.character(raw$date_recorded), format="%Y-%m-%d") - as.Date(raw$construction_year_2, format="%Y-%m-%d")
+
+```
+
+
+Luego, creamos una variable que expresa la cantidad de agua per capita que debería otorgar cada bomba, dividiendo la cantidad de agua por la población cercana. Además, generamos variables ceparadas para registrar el día y mes en que se registró la bomba.
+
+```{r}
+# Creamos cantidad de agua que dará la bomba por habitante
+raw$watergiv = as.numeric(raw$amount_tsh / raw$population)
+# Convertimos fecha de registro a formato fecha.
+raw$date_recorded = as.Date(as.character(raw$date_recorded), format="%Y-%m-%d")
+raw = raw %>% select(-construction_year_2) # Ya no necesitamos esta variable auxiliar.
+raw$day_recorded = weekdays(raw$date_recorded) %>% as.factor()
+raw$month_recorded = months(raw$date_recorded) %>% as.factor()
+```
+
+
+Finalmente, creamos una variable que estima la distancia geográfica entre la localización de cada bomba y un punto arbitrario (la media de longitud y latitud de las bombas).
+
+```{r}
+# Creamos distancias
+raw$dist_media = geosphere::distGeo(as.matrix(raw[,c('longitude','latitude')]), c(39.270564,-6.786273))
+```
+
+
+
+### Text mining
+
+Más tarde haremos transformación a dummies. Como las variables no pueden tener nombres con espacios o caracteres extraños (categorías se volverán variables), antes de seguir haremos una pequeña limpieza de texto. Además, realizamos un pequeño text mining para reducir la cantidad de categorías en un par de variables categóricas (`funder` e `installer`).
+
+Entonces, primero, hacemos una limpieza general de palabras.
+
+```{r}
+# Seleccionakos variables a limpiar
+factores = raw %>% select_if(is.factor) %>% names()
+to_clean_raw = names(raw) %in% factores 
+# Aplicamos, con stringi y stringr, limpieza:
+raw[,to_clean_raw] = tbl_df(lapply(X=raw[,to_clean_raw], function(x){
+  x = as.character(x)
+  x = ifelse(x=='', 'unknown', x) # cambios los vacíos por "desconocido".
+  x = str_to_lower(x) # todo a minúscula
+  x = removePunctuation(x) # eliminamos puntiaciones
+  x = stripWhitespace(x) # eliminamos espacios al comienzo o final 
+  x = stringr::str_replace_all(string = x, pattern = ' ', replacement = '_')
+  x = stringr::str_replace_all(string = x, pattern = '-', replacement = '_')
+  x = stringr::str_replace_all(string = x, pattern = '/', replacement = '_')
+  x = stringr::str_replace_all(string = x, pattern = "'", replacement = '')
+  x = stringr::str_replace_all(string = x, pattern = "\\(", replacement = '')
+  x = stringr::str_replace_all(string = x, pattern = "\\)", replacement = '')
+  x = as.factor(x)
+}))
+```
+
+
+Luego, buscamos reducir la cantidad de categorías de acuerdo a la similitud de ellas. Para esto utilizamos la función `stringdist` del paquete del mismo nombre. Se emplea, además, el método de coseno y se establece como parámetro de similitud valores inferiores a 0.1. Lo que se tratará de hacer es, primero, buscar los financistas e instaladores con más de 100 bombas. Esos serán los patrones a detectar en el resto de categorías.
+
+**NOTA** Esta es una función propia.
+
+```{r}
+### FUNDER
+# Buscamos los funder con más de 400 bombas.
+major_funder = raw %>% count(funder) %>% arrange(desc(n)) %>% filter(n>100) %>% select(funder) %>% c()
+major_funder = major_funder$funder
+
+# Creo variable funder_text_mining para cambiar allí y mantener la original.
+raw$funder_tm = raw$funder
+
+# Reemplazo con valores cercanos a 0.1 de coseno.
+for (i in 1:length(major_funder)) {
+  cosine_dist = as.data.frame(stringdist(a = major_funder[i], b = raw$funder_tm, method = 'cosine'))
+  names(cosine_dist) = 'cosine_value'
+  mask = which(cosine_dist$cosine_value>0 & cosine_dist$cosine_value<0.1)
+  raw$funder_tm[mask] = major_funder[i]
+}
+
+# Con esto pasamos de 2.140 a 2.001 categorías.
+```
+
+
+En el caso de instaladores, hacemos previamente una limpieza que resulta evidente al mirar las categorías mayoritarias.
+En suma, con esto se pasó en `funder` de 2.140 a 2.001 categorías; y en `installer` de 2.104 a 1.713.
+
+```{r}
+### INSTALLER
+# Corregimos un opar de errores evidentes
+raw = raw %>% mutate(installer = ifelse(installer=='gove', 'government', installer))
+raw = raw %>% mutate(installer = ifelse(installer=='commu', 'community', installer))
+raw = raw %>% mutate(installer = ifelse(installer=='danid', 'danida', installer))
+raw = raw %>% mutate(installer = ifelse(installer=='0', 'unknown', installer))
+
+# Buscamos los installer con más de 300 bombas.
+major_installer = raw %>% count(installer) %>% arrange(desc(n)) %>% filter(n>100) %>% select(installer) %>% c()
+major_installer = major_installer$installer
+
+# Creo variable funder_text_mining para cambiar allí.
+raw$installer_tm = raw$installer
+
+# Reemplazo con valores cercanos a 0.1 de coseno.
+for (i in 1:length(major_installer)) {
+  cosine_dist = as.data.frame(stringdist(a = major_installer[i], b = raw$installer_tm, method = 'cosine'))
+  names(cosine_dist) = 'cosine_value'
+  mask = which(cosine_dist$cosine_value>0 & cosine_dist$cosine_value<0.1)
+  raw$installer_tm[mask] = major_installer[i]
+}
+# Con esto pasamos de 2.104 a 1.713 categorías.
+```
+
+
+
+### Target encoder
+
+Sólo hemos realizado una transformación de variable de acuerdo a la target, pues es la única que resultó útil. Se hizo con `funder`.
+Cabe destacar que hay financistas presentes en el conjunto de entrenamiento que no están en test, por lo que el siguiente procedimiento deberá asignarles un valor aleatoriamente. 
+
+Lo que haremos serán cluster de financistas de acuerdo al estado en que están las bombas que han financiado. Por ello, debemos primero crear los datos agregados del estado de las bombas según `funder`. Antes, cargamos las funciones para el cluster; y luego construimos unos datos transitorios de train + target.
+
+
+```{r}
+# Cargamos librerías.
+p_load(factoextra,cluster,fpc,clValid)
+
+# Creamos dataset transitorio de datos train + target
+tset = merge(target, raw%>%filter(etiqueta=='train'), by='id') %>% select(-etiqueta) 
+```
+
+
+A continuación creo el dataset de proporción de bombas según su estado para cada financista.
+
+```{r}
+funder_sum = tset %>% group_by(funder_tm, status_group) %>% 
+  summarise(total=n()) %>%
+  pivot_wider(names_from = status_group, values_from = total) %>%
+  rename(need_repair=`functional needs repair`, 
+         non_functional=`non functional`) %>%
+  mutate(functional = ifelse(is.na(functional), 0, functional),
+         need_repair = ifelse(is.na(need_repair), 0, need_repair),
+         non_functional = ifelse(is.na(non_functional), 0, non_functional)) %>%
+  transmute(total = sum(functional+need_repair+non_functional),
+            prop_fun = functional/total,
+            prop_rep = need_repair/total,
+            prop_non = non_functional/total) %>%
+  ungroup()
+```
+
+
+Ahora el dataset para conformar los clusters.
+
+```{r}
+# Preparo dataset para clustering
+df_cluster_funder = funder_sum %>% select(-total)
+rownames(df_cluster_funder) = df_cluster_funder$funder_tm
+df_cluster_funder = df_cluster_funder %>% select(-funder_tm)
+```
+
+
+Y finalmente los cluster jerárquicos, a través del método 'ward.D2', y utilizando 'minkowski' para calcular las distancias.
+
+```{r}
+# Cluster Jerárquico
+# Listado de métodos a aplicar: "average", "mcquitty", "ward.D2".
+hclust_funder = hclust(dist(df_cluster_funder, method = 'minkowski'), method = "ward.D2")
+hc_funder = as.data.frame(cutree(hclust_funder, h=1))
+hc_funder$funder = rownames(hc_funder)
+rownames(hc_funder) = seq(1:nrow(hc_funder))
+hc_funder = hc_funder %>% rename(cluster=`cutree(hclust_funder, h = 1)`)
+
+# creo nueva variable -hc
+raw$funder_hc = raw$funder
+raw = left_join(x = raw, y = hc_funder, by=c('funder_hc'='funder')) %>% select(-funder_hc) %>% rename(funder_hc=cluster)
+# algunos shame_name no están en test. les doy valor 0.
+raw = raw %>% mutate(funder_hc = ifelse(is.na(funder_hc), 0, funder_hc))
+raw$funder_hc = as.factor(raw$funder_hc)
+```
+
+
+### Transformaciones automáticas
+
+Ahora, simplemente, utilizaremos la función `prepareSet` de `caret` para procesar las variables del conjunto de datos.
+
+```{r, eval=FALSE}
+raw_process = prepareSet(dataSet = raw, analysisDate = as.Date('2014-01-01'))
+```
+
+
+Luego, haremos transformación a dummies de las variables con menos de 20 categorías.
+
+```{r, eval=FALSE}
+raw_dumm = dummy_columns(.data = raw_process, select_columns = c('basin','extraction_type_group','management','payment','water_quality','quantity','source','waterpoint_type','day_recorded','month_recorded','public.meeting.num','permit.num'))
+```
+
+
+---
+
+## Modelo de clasificación
+
+Hemos probado tres tipos de algoritmo para resolver este ejercicio: **Random Forest**, **XGBoost**, y **LightGBM**. El primero es el que mejores resultados dio, así que lo exponemos aquí.
+
+### Muestreo
+
+Primero tenemos que re-crear nuestros conjuntos de train y test, y luego entrenamos el modelo.
+
+```{r, eval=FALSE}
+target = read.csv('data/Training set labels.csv')
+train_proc = raw_dumm %>% filter(etiqueta.num==59363)
+train_proc = merge(train_proc, target, by="id")
+test_proc = raw_dumm %>% filter(etiqueta.num==14850)
+```
+
+### Modelo
+En este modelo hemos incluido las 150 variables resultantes tras eliminar algunas, crear otras, y transformar a dummie la mayoría. Sólo hemos descartado cuatro variables que tienen nula información.
+
+```{r, eval=FALSE}
+my_mod = ranger(as.factor(status_group)~.-etiqueta.num-installer.notnull-subvillage.notnull,
+                 data = train_proc, 
+                 importance = 'impurity', 
+                 verbose = TRUE, 
+                 num.trees = 1000, 
+                 mtry = 12,
+)
+```
+
+
+### Submission
+
+Este modelo otorga un score en la plataforma de **0.8259**.
+
+```{r, eval=FALSE}
+pred_base = as.vector(predict(my_mod, test_proc)$prediction)
+my_subBase = data.frame(id = test_proc$id, status_group = pred_base)
+id_test = as.data.frame(fread('data/Test set values.csv')) %>% dplyr::select(id) %>% as.data.table
+my_subBase_VF = left_join(id_test, my_subBase)
+# Escribo los datos
+fwrite(my_subBase_VF, 'data/sub_28may_4.csv', sep=',')
+```
+
+
+<p align="center">
+  <img width="50%" height="50%" src="data/pumpitup.png">
+</p>
